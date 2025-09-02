@@ -1,0 +1,13 @@
+{
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "type": "text",
+      "title": "Pi Credit App",
+      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 0 },
+      "options": { "content": "Pi Credit App dashboard (placeholder)" }
+    }
+  ],
+  "schemaVersion": 30,
+  "title": "pi-credit-app-dashboard"
+}

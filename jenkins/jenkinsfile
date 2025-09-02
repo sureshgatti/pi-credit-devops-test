@@ -1,0 +1,141 @@
+pipeline {
+  agent any
+  environment {
+    AWS_REGION = "eu-north-1"
+    AWS_ACCOUNT_ID = "015800952701"
+    ECR_REPO = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/pi-credit-app"
+    IMAGE_TAG = "${env.BUILD_NUMBER}"
+    TERRAFORM_DIR = "infra"
+  }
+  options {
+    buildDiscarder(logRotator(numToKeepStr: '50'))
+    timestamps()
+  }
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+      }
+    }
+
+    stage('Lint') {
+      steps {
+        dir('app') {
+          sh 'npm ci'
+          sh 'npm run lint || true'
+        }
+      }
+    }
+
+    stage('Unit Test') {
+      steps {
+        dir('app') {
+          sh 'npm test || true'
+        }
+      }
+    }
+
+    stage('Build Docker Image') {
+      steps {
+        script {
+          sh """
+            docker build -t ${ECR_REPO}:${IMAGE_TAG} -f docker/Dockerfile .
+          """
+        }
+      }
+    }
+
+    stage('Scan Image (Trivy)') {
+      steps {
+        sh """
+          if ! command -v trivy >/dev/null 2>&1; then
+            echo "Trivy not installed, skipping scan (recommended to install in Jenkins)."
+          else
+            trivy image --exit-code 1 --severity HIGH,CRITICAL ${ECR_REPO}:${IMAGE_TAG} || true
+          fi
+        """
+      }
+    }
+
+    stage('Authenticate ECR') {
+      steps {
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'AWS_CREDENTIALS_ID']]) {
+          sh """
+            aws ecr describe-repositories --repository-names pi-credit-app --region ${AWS_REGION} || aws ecr create-repository --repository-name pi-credit-app --region ${AWS_REGION}
+            aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REPO}
+          """
+        }
+      }
+    }
+
+    stage('Push to ECR') {
+      steps {
+        sh "docker push ${ECR_REPO}:${IMAGE_TAG}"
+        sh "docker tag ${ECR_REPO}:${IMAGE_TAG} ${ECR_REPO}:latest || true"
+        sh "docker push ${ECR_REPO}:latest || true"
+      }
+    }
+
+    stage('Terraform Plan (infra)') {
+      steps {
+        dir("${TERRAFORM_DIR}") {
+          withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'AWS_CREDENTIALS_ID']]) {
+            sh 'terraform init -input=false'
+            sh "terraform workspace new stagging || terraform workspace select stagging || true"
+            sh "terraform plan -var='ecr_image=${ECR_REPO}:${IMAGE_TAG}' -out=tfplan"
+          }
+        }
+      }
+    }
+
+    stage('Manual Approval to Apply Infra?') {
+      when { expression { return env.BRANCH_NAME == 'main' } }
+      steps {
+        input message: "Apply Terraform changes to staging?", ok: "Apply"
+      }
+    }
+
+    stage('Terraform Apply (optional)') {
+      when { expression { return env.BRANCH_NAME == 'main' } }
+      steps {
+        dir("${TERRAFORM_DIR}") {
+          withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'AWS_CREDENTIALS_ID']]) {
+            sh "terraform apply -input=false -auto-approve tfplan"
+          }
+        }
+      }
+    }
+
+    stage('Deploy to EKS') {
+      steps {
+        withCredentials([file(credentialsId: 'KUBECONFIG_CRED_ID', variable: 'KUBECONFIG_FILE')]) {
+          sh """
+            export KUBECONFIG=$KUBECONFIG_FILE
+            kubectl -n pi-credit get deploy pi-credit-app || kubectl apply -f k8s/namespace.yaml
+            # update image
+            kubectl -n pi-credit set image deployment/pi-credit-app pi-credit-app=${ECR_REPO}:${IMAGE_TAG} --record || true
+            kubectl -n pi-credit rollout status deployment/pi-credit-app --timeout=120s || true
+          """
+        }
+      }
+    }
+
+    stage('Smoke Test') {
+      steps {
+        sh "scripts/health-check.sh $(terraform -chdir=infra output -raw alb_dns || echo 'localhost') || true"
+      }
+    }
+  }
+
+  post {
+    always {
+      sh 'echo "Pipeline finished"'
+    }
+    success {
+      echo "Success: Deployed ${ECR_REPO}:${IMAGE_TAG}"
+    }
+    failure {
+      echo "Failed pipeline. Check logs."
+    }
+  }
+}

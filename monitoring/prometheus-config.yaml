@@ -1,0 +1,7 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'kubernetes-pi-credit'
+    static_configs:
+      - targets: ['pi-credit-svc.pi-credit.svc.cluster.local:3000']
